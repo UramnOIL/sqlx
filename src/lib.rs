@@ -70,6 +70,9 @@ pub use sqlx_core::sqlite::{self, Sqlite, SqliteConnection, SqliteExecutor, Sqli
 #[doc(hidden)]
 pub extern crate sqlx_macros;
 
+#[cfg(feature = "macros")]
+pub use sqlx_macros::test;
+
 // derives
 #[cfg(feature = "macros")]
 #[doc(hidden)]

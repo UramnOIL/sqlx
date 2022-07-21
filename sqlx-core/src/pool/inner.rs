@@ -14,18 +14,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::pool::options::PoolConnectionMetadata;
+use futures_util::future::{self, Either};
 use std::time::{Duration, Instant};
-
-/// Ihe number of permits to release to wake all waiters, such as on `PoolInner::close()`.
-///
-/// This should be large enough to realistically wake all tasks waiting on the pool without
-/// potentially overflowing the permits count in the semaphore itself.
-const WAKE_ALL_PERMITS: usize = usize::MAX / 2;
 
 pub(crate) struct PoolInner<DB: Database> {
     pub(super) connect_options: <DB::Connection as Connection>::Options,
     pub(super) idle_conns: ArrayQueue<Idle<DB>>,
-    pub(super) semaphore: Semaphore,
+    pub(super) semaphore: Arc<Semaphore>,
     pub(super) size: AtomicU32,
     pub(super) num_idle: AtomicUsize,
     is_closed: AtomicBool,
@@ -40,16 +35,18 @@ impl<DB: Database> PoolInner<DB> {
     ) -> Arc<Self> {
         let capacity = options.max_connections as usize;
 
-        // ensure the permit count won't overflow if we release `WAKE_ALL_PERMITS`
-        // this assert should never fire on 64-bit targets as `max_connections` is a u32
-        let _ = capacity
-            .checked_add(WAKE_ALL_PERMITS)
-            .expect("max_connections exceeds max capacity of the pool");
+        let semaphore = if let Some(parent) = &options.parent_pool {
+            assert!(options.max_connections <= parent.options().max_connections);
+            assert_eq!(options.fair, parent.options().fair);
+            parent.0.semaphore.clone()
+        } else {
+            Arc::new(Semaphore::new(options.fair, capacity))
+        };
 
         let pool = Self {
             connect_options,
             idle_conns: ArrayQueue::new(capacity),
-            semaphore: Semaphore::new(options.fair, capacity),
+            semaphore,
             size: AtomicU32::new(0),
             num_idle: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
@@ -82,15 +79,8 @@ impl<DB: Database> PoolInner<DB> {
     }
 
     pub(super) fn close<'a>(self: &'a Arc<Self>) -> impl Future<Output = ()> + 'a {
-        let already_closed = self.is_closed.swap(true, Ordering::AcqRel);
-
-        if !already_closed {
-            // if we were the one to mark this closed, release enough permits to wake all waiters
-            // we can't just do `usize::MAX` because that would overflow
-            // and we can't do this more than once cause that would _also_ overflow
-            self.semaphore.release(WAKE_ALL_PERMITS);
-            self.on_closed.notify(usize::MAX);
-        }
+        self.is_closed.store(true, Ordering::Release);
+        self.on_closed.notify(usize::MAX);
 
         async move {
             // Close any currently idle connections in the pool.
@@ -101,7 +91,7 @@ impl<DB: Database> PoolInner<DB> {
             // Wait for all permits to be released.
             let _permits = self
                 .semaphore
-                .acquire(WAKE_ALL_PERMITS + (self.options.max_connections as usize))
+                .acquire(self.options.max_connections as usize)
                 .await;
 
             // Clean up any remaining connections.
@@ -117,6 +107,10 @@ impl<DB: Database> PoolInner<DB> {
         }
     }
 
+    async fn acquire_permit(&self) -> Result<SemaphoreReleaser<'_>, Error> {
+        self.close_event().do_until(self.semaphore.acquire(1)).await
+    }
+
     #[inline]
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<Floating<DB, Idle<DB>>> {
         if self.is_closed() {
@@ -124,6 +118,7 @@ impl<DB: Database> PoolInner<DB> {
         }
 
         let permit = self.semaphore.try_acquire(1)?;
+
         self.pop_idle(permit).ok()
     }
 
@@ -184,11 +179,9 @@ impl<DB: Database> PoolInner<DB> {
             self.options.acquire_timeout,
             async {
                 loop {
-                    let permit = self.semaphore.acquire(1).await;
+                    // Handles the close-event internally
+                    let permit = self.acquire_permit().await?;
 
-                    if self.is_closed() {
-                        return Err(Error::PoolClosed);
-                    }
 
                     // First attempt to pop a connection from the idle queue.
                     let guard = match self.pop_idle(permit) {

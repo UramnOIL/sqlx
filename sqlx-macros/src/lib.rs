@@ -20,6 +20,7 @@ mod common;
 mod database;
 mod derives;
 mod query;
+mod test;
 
 #[cfg(feature = "migrate")]
 mod migrate;
@@ -97,49 +98,16 @@ pub fn migrate(input: TokenStream) -> TokenStream {
     }
 }
 
-#[doc(hidden)]
+// We can't do our normal facade approach with an attribute, but thankfully we can now
+// have docs out-of-line quite easily.
+#[doc = include_str!("test.md")]
 #[proc_macro_attribute]
-pub fn test(_attr: TokenStream, input: TokenStream) -> TokenStream {
+pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = syn::parse_macro_input!(args as syn::AttributeArgs);
     let input = syn::parse_macro_input!(input as syn::ItemFn);
 
-    let ret = &input.sig.output;
-    let name = &input.sig.ident;
-    let body = &input.block;
-    let attrs = &input.attrs;
-
-    let result = if cfg!(feature = "_rt-tokio") {
-        quote! {
-            #[test]
-            #(#attrs)*
-            fn #name() #ret {
-                ::sqlx_rt::tokio::runtime::Builder::new_multi_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .unwrap()
-                    .block_on(async { #body })
-            }
-        }
-    } else if cfg!(feature = "_rt-async-std") {
-        quote! {
-            #[test]
-            #(#attrs)*
-            fn #name() #ret {
-                ::sqlx_rt::async_std::task::block_on(async { #body })
-            }
-        }
-    } else if cfg!(feature = "_rt-actix") {
-        quote! {
-            #[test]
-            #(#attrs)*
-            fn #name() #ret {
-                ::sqlx_rt::actix_rt::System::new()
-                    .block_on(async { #body })
-            }
-        }
-    } else {
-        panic!("one of 'runtime-actix', 'runtime-async-std' or 'runtime-tokio' features must be enabled");
-    };
-
-    result.into()
+    match test::expand(args, input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }
